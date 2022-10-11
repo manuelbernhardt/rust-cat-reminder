@@ -1,18 +1,25 @@
-use std::{thread, time};
-use std::fs::File;
+use std::time;
 use std::fs;
+use std::fs::read;
 use std::path::Path;
-
-use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
+use std::io::Error;
 use std::io::ErrorKind::InvalidData;
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
-use tokio_cron_scheduler::{JobScheduler, JobToRun, Job};
+
+use actix::{Actor, Context};
+use actix::prelude::*;
+use chrono::{DateTime, Utc, Duration};
 use smart_leds::{SmartLedsWrite, RGB8};
 use ws281x_rpi::Ws2812Rpi;
+use gpiod::{Chip, Options, Masked, AsValuesMut};
 
 const NUM_LEDS: usize = 10;
 
+const BLINK_DELAY: time::Duration = time::Duration::from_millis(500);
+
+const GPIO_BUTTON_PIN: u8 = 5;
+
 const STATE_FILE_PATH: &str = "cat_reminder_state";
+
 
 /*
     Program logic:
@@ -31,99 +38,48 @@ const STATE_FILE_PATH: &str = "cat_reminder_state";
       - store state
       - stop blinking, set to light green
  */
-async fn main() {
+fn main() {
     println!("Program start");
 
-    const PIN: i32 = 18;
-    const DELAY: time::Duration = time::Duration::from_millis(1000);
+    const LED_PIN: i32 = 18;
 
-    const DELAY_DARK_GREEN: time::Duration = time::Duration::from_secs(8 * 60 * 60);
-    const DELAY_ORANGE: time::Duration = time::Duration::from_secs(12 * 60 * 60);
-    const DELAY_RED: time::Duration = time::Duration::from_secs(24 * 60 * 60);
-    const DELAY_DARK_RED: time::Duration = time::Duration::from_secs(28 * 60 * 60);
-    const DELAY_RAINBOW: time::Duration = time::Duration::from_secs(30 * 60 * 60);
+    let system = actix::System::new();
 
-    let mut sched = JobScheduler::new();
-    let mut ws = Ws2812Rpi::new(NUM_LEDS as i32, PIN).unwrap();
+    let last_cleaning_time: DateTime<Utc> = load_state();
 
-    let mut data: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
-    let empty: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
+    read_gpio();
 
-    let mut last_cleaning_time: DateTime<Utc> = load_state();
+    system.block_on(async {
+        let _ = LedManager::create(|_ctx| {
+            LedManager {
+                ws: Ws2812Rpi::new(NUM_LEDS as i32, LED_PIN).unwrap(),
+                last_cleaning_time,
+                is_blinking: false
+            }
+        });
+    });
 
-    sched.add(Job::new("1/10 * * * * *", |uuid, l| {
-        println!("I run every 10 seconds");
-        let time_elapsed = Utc::now().signed_duration_since(last_cleaning_time);
-        if time_elapsed < DELAY_DARK_GREEN {
-            set_all_to(&mut ws, |led| led.g = 22 ); // TODO light green
-        } else if time_elapsed < DELAY_ORANGE {
-            set_all_to(&mut ws, |led| led.g = 32 ); // dark green
-        } else if time_elapsed < DELAY_RED {
-            set_all_to(&mut ws, |led| { // TODO orange
-                led.g = 32;
-                led.r = 32;
-            })
-        } else if time_elapsed < DELAY_DARK_RED { // TODO red blinking
-            led.g = 0;
-            led.r = 32;
-        } else {
-            // TODO rainbow
-            led.g = 12;
-            led.r = 32;
-        }
-
-    }).await.unwrap());
-
-
-    // Blink the LED's in a blue-green-red-white pattern.
-    for led in data.iter_mut().step_by(5) {
-        led.b = 40; // blue
-    }
-
-    if NUM_LEDS > 1 {
-        for led in data.iter_mut().skip(1).step_by(5) {
-            led.g = 32; // green
-        }
-    }
-
-    if NUM_LEDS > 2 {
-        for led in data.iter_mut().skip(2).step_by(5) {
-            led.r = 32; // red
-        }
-    }
-
-    if NUM_LEDS > 3 {
-        for led in data.iter_mut().skip(3).step_by(5) {
-            // white
-            led.r = 32;
-            led.g = 32;
-            led.b = 32;
-        }
-    }
-
-    loop {
-        // On
-        println!("LEDS on");
-        //ws.write(data.iter().cloned()).unwrap();
-        set_all_to(&mut ws, |led| led.g = 32 );
-        thread::sleep(DELAY);
-
-        // Off
-        println!("LEDS off");
-        ws.write(empty.iter().cloned()).unwrap();
-        thread::sleep(DELAY);
-    }
+    system.run().unwrap();
 }
 
-fn set_all_to<C>(ws: &mut Ws2812Rpi, colorizer: C) -> () where C: Fn(&mut RGB8) -> () {
-    let mut data: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
-    for led in data.iter_mut().step_by(1) {
-        colorizer(led)
-    }
-    ws.write(data.iter().cloned()).unwrap();
+fn read_gpio() -> std::io::Result<()> {
+    let chip = Chip::new("gpiochip0")?; // open chip
+
+    let opts = Options::input([5]) // configure lines offsets
+    .consumer("my-inputs"); // optionally set consumer string
+
+    let inputs = chip.request_lines(opts)?;
+
+    // get all three values
+    let values = inputs.get_values([false; 1])?;
+
+    println!("values: {:?}", values);
+
+    Ok(())
 }
 
-fn load_state<R: Read>() -> DateTime<Utc> {
+
+fn load_state() -> DateTime<Utc> {
     return if Path::new(STATE_FILE_PATH).exists() {
         let time_str = fs::read_to_string(STATE_FILE_PATH);
 
@@ -135,7 +91,7 @@ fn load_state<R: Read>() -> DateTime<Utc> {
             Ok(t) => t,
             Err(err) => {
                 println!("Error reading time from state: {:?}", err);
-                Utc::now();
+                Utc::now().to_owned()
             }
         };
 
@@ -147,3 +103,125 @@ fn load_state<R: Read>() -> DateTime<Utc> {
     }
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Tick;
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct BlinkRed {
+    led_on: bool
+}
+
+struct LedManager {
+    ws: Ws2812Rpi,
+    last_cleaning_time: DateTime<Utc>,
+    is_blinking: bool
+}
+
+impl Actor for LedManager {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        // first tick for initialization right away
+        ctx.address().do_send(Tick { });
+
+        // schedule check every 10 seconds
+        let _ = ctx.run_interval(time::Duration::from_secs(1), |_this, ctx| {
+            println!("Ticking");
+            ctx.address().do_send(Tick { });
+        });
+    }
+
+}
+
+impl Handler<Tick> for LedManager {
+    type Result = ();
+
+
+    fn handle(&mut self, _msg: Tick, ctx: &mut Self::Context) -> Self::Result {
+        println!("Tick received");
+
+        let delay_dark_green: Duration = Duration::seconds(8);
+        let delay_orange: Duration = Duration::seconds(12);
+        let delay_red: Duration = Duration::seconds(24);
+        let delay_dark_red: Duration = Duration::seconds(26);
+
+
+        let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
+        if time_elapsed < delay_dark_green {
+            println!("Light green");
+            set_all_to(&mut self.ws, |led| {
+                led.r = 50;
+                led.g = 174;
+                led.b = 0;
+            });
+        } else if time_elapsed < delay_orange {
+            println!("Dark green");
+            set_all_to(&mut self.ws, |led| {
+                led.r = 0;
+                led.g = 60;
+                led.b = 0;
+            }); // dark green
+        } else if time_elapsed < delay_red {
+            println!("Orange");
+            set_all_to(&mut self.ws, |led| {
+                led.r = 200;
+                led.g = 165;
+                led.b = 0;
+            })
+        } else if time_elapsed < delay_dark_red {
+            println!("Red");
+            set_all_to(&mut self.ws, |led| {
+                led.r = 255;
+                led.g = 0;
+                led.b = 0;
+            });
+        } else {
+            if !self.is_blinking {
+                println!("Blinking red");
+                self.is_blinking = true;
+                ctx.address().do_send(BlinkRed { led_on: false});
+            }
+        }
+
+
+    }
+}
+
+impl Handler<BlinkRed> for LedManager {
+    type Result = ();
+
+    fn handle(&mut self, msg: BlinkRed, ctx: &mut Self::Context) -> Self::Result {
+        println!("Blinking red received");
+        if msg.led_on {
+            // turn off
+            let empty: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
+            self.ws.write(empty.iter().cloned()).unwrap();
+
+            let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
+                println!("Blinking red off");
+                ctx.address().do_send(BlinkRed { led_on: false });
+            });
+        } else {
+            // turn on
+            set_all_to(&mut self.ws, |led| {
+                led.r = 255;
+                led.g = 0;
+                led.b = 0;
+            });
+            let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
+                println!("Blinking red on");
+                ctx.address().do_send(BlinkRed { led_on: true });
+            });
+        }
+    }
+}
+
+fn set_all_to<C>(ws: &mut Ws2812Rpi, colorizer: C) -> () where C: Fn(&mut RGB8) -> () {
+    let mut data: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
+    for led in data.iter_mut().step_by(1) {
+        colorizer(led)
+    }
+    ws.write(data.iter().cloned()).unwrap();
+}
