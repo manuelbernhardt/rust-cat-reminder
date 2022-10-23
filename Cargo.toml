@@ -5,8 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-smart-leds = "0.3.0"
-ws281x-rpi = "0.0.1"
+rs_ws281x = "0.4.4"
 chrono = "0.4.22"
 actix = "0.13.0"
 gpiod = "0.2.2"
+
+[package.metadata.cross.target.armv7-unknown-linux-gnueabihf]
+pre-build = "./scripts/install-ws281x.sh"

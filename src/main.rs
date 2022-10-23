@@ -1,6 +1,5 @@
 use std::time;
 use std::fs;
-use std::fs::read;
 use std::path::Path;
 use std::io::Error;
 use std::io::ErrorKind::InvalidData;
@@ -8,15 +7,12 @@ use std::io::ErrorKind::InvalidData;
 use actix::{Actor, Context};
 use actix::prelude::*;
 use chrono::{DateTime, Utc, Duration};
-use smart_leds::{SmartLedsWrite, RGB8};
-use ws281x_rpi::Ws2812Rpi;
-use gpiod::{Chip, Options, Masked, AsValuesMut};
-
-const NUM_LEDS: usize = 10;
+use rs_ws281x::*;
+use gpiod::{Chip, Options};
 
 const BLINK_DELAY: time::Duration = time::Duration::from_millis(500);
 
-const GPIO_BUTTON_PIN: u8 = 5;
+const GPIO_BUTTON_PIN: u32 = 5;
 
 const STATE_FILE_PATH: &str = "cat_reminder_state";
 
@@ -41,18 +37,36 @@ const STATE_FILE_PATH: &str = "cat_reminder_state";
 fn main() {
     println!("Program start");
 
+    const NUM_LEDS: i32 = 10;
     const LED_PIN: i32 = 18;
 
     let system = actix::System::new();
 
     let last_cleaning_time: DateTime<Utc> = load_state();
 
-    read_gpio();
+    let chip: Chip = Chip::new("gpiochip0").expect("Cannot open GPIO");
+
+    let controller: Controller = ControllerBuilder::new()
+        .freq(800_000)
+        .dma(10)
+        .channel(
+            0, // Channel Index
+            ChannelBuilder::new()
+                .pin(LED_PIN) // GPIO 10 = SPI0 MOSI
+                .count(NUM_LEDS) // Number of LEDs
+                .strip_type(StripType::Ws2812)
+                .brightness(100) // default: 255
+                .build(),
+        )
+        .build()
+        .unwrap();
+
 
     system.block_on(async {
         let _ = LedManager::create(|_ctx| {
             LedManager {
-                ws: Ws2812Rpi::new(NUM_LEDS as i32, LED_PIN).unwrap(),
+                chip,
+                controller,
                 last_cleaning_time,
                 is_blinking: false
             }
@@ -62,20 +76,12 @@ fn main() {
     system.run().unwrap();
 }
 
-fn read_gpio() -> std::io::Result<()> {
-    let chip = Chip::new("gpiochip0")?; // open chip
-
-    let opts = Options::input([5]) // configure lines offsets
-    .consumer("my-inputs"); // optionally set consumer string
-
+fn read_gpio(chip: &Chip) -> std::io::Result<bool> {
+    let opts = Options::input([GPIO_BUTTON_PIN]);
     let inputs = chip.request_lines(opts)?;
-
-    // get all three values
     let values = inputs.get_values([false; 1])?;
-
-    println!("values: {:?}", values);
-
-    Ok(())
+    // false if pushed
+    Ok(!values[0])
 }
 
 
@@ -87,20 +93,22 @@ fn load_state() -> DateTime<Utc> {
             .and_then(|str| DateTime::parse_from_rfc3339(&*str).map_err(|e| Error::new(InvalidData, e)))
             .map(|t| t.with_timezone(&Utc));
 
-        let time = match parsed_time {
+        match parsed_time {
             Ok(t) => t,
             Err(err) => {
                 println!("Error reading time from state: {:?}", err);
                 Utc::now().to_owned()
             }
-        };
-
-        time
+        }
     } else {
-        let now = Utc::now();
-        fs::write(STATE_FILE_PATH, now.to_rfc3339()).unwrap();
-        now
+        reset_state()
     }
+}
+
+fn reset_state() -> DateTime<Utc> {
+    let now = Utc::now();
+    fs::write(STATE_FILE_PATH, now.to_rfc3339()).unwrap();
+    now
 }
 
 #[derive(Message)]
@@ -114,7 +122,8 @@ struct BlinkRed {
 }
 
 struct LedManager {
-    ws: Ws2812Rpi,
+    chip: Chip,
+    controller: Controller,
     last_cleaning_time: DateTime<Utc>,
     is_blinking: bool
 }
@@ -126,8 +135,8 @@ impl Actor for LedManager {
         // first tick for initialization right away
         ctx.address().do_send(Tick { });
 
-        // schedule check every 10 seconds
-        let _ = ctx.run_interval(time::Duration::from_secs(1), |_this, ctx| {
+        // schedule check every 5 seconds
+        let _ = ctx.run_interval(time::Duration::from_secs(5), |_this, ctx| {
             println!("Ticking");
             ctx.address().do_send(Tick { });
         });
@@ -142,50 +151,41 @@ impl Handler<Tick> for LedManager {
     fn handle(&mut self, _msg: Tick, ctx: &mut Self::Context) -> Self::Result {
         println!("Tick received");
 
-        let delay_dark_green: Duration = Duration::seconds(8);
-        let delay_orange: Duration = Duration::seconds(12);
-        let delay_red: Duration = Duration::seconds(24);
-        let delay_dark_red: Duration = Duration::seconds(26);
+        let delay_dark_green: Duration = Duration::hours(8);
+        let delay_orange: Duration = Duration::hours(12);
+        let delay_red: Duration = Duration::hours(24);
+        let delay_dark_red: Duration = Duration::hours(26);
 
+        let button_pushed = read_gpio(& self.chip).unwrap();
+        if button_pushed {
+            println!("Button pushed");
+            // reset
+            self.last_cleaning_time = reset_state();
+
+            if self.is_blinking {
+                self.is_blinking = false;
+            }
+        }
 
         let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
         if time_elapsed < delay_dark_green {
             println!("Light green");
-            set_all_to(&mut self.ws, |led| {
-                led.r = 50;
-                led.g = 174;
-                led.b = 0;
-            });
+            set_all_to(&mut self.controller, [0, 60, 0, 0]); // light green
         } else if time_elapsed < delay_orange {
             println!("Dark green");
-            set_all_to(&mut self.ws, |led| {
-                led.r = 0;
-                led.g = 60;
-                led.b = 0;
-            }); // dark green
+            set_all_to(&mut self.controller, [0, 20, 0, 0]); // dark green
         } else if time_elapsed < delay_red {
             println!("Orange");
-            set_all_to(&mut self.ws, |led| {
-                led.r = 200;
-                led.g = 165;
-                led.b = 0;
-            })
+            set_all_to(&mut self.controller, [0, 60, 255, 0])
         } else if time_elapsed < delay_dark_red {
             println!("Red");
-            set_all_to(&mut self.ws, |led| {
-                led.r = 255;
-                led.g = 0;
-                led.b = 0;
-            });
+            set_all_to(&mut self.controller, [0, 0, 255, 0]);
         } else {
             if !self.is_blinking {
-                println!("Blinking red");
                 self.is_blinking = true;
                 ctx.address().do_send(BlinkRed { led_on: false});
             }
         }
-
-
     }
 }
 
@@ -193,35 +193,31 @@ impl Handler<BlinkRed> for LedManager {
     type Result = ();
 
     fn handle(&mut self, msg: BlinkRed, ctx: &mut Self::Context) -> Self::Result {
-        println!("Blinking red received");
-        if msg.led_on {
+        if !self.is_blinking {
             // turn off
-            let empty: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
-            self.ws.write(empty.iter().cloned()).unwrap();
+            set_all_to(&mut self.controller, [0, 0, 0, 0]);
+        } else if msg.led_on {
+            // turn off
+            set_all_to(&mut self.controller, [0, 0, 0, 0]);
 
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
-                println!("Blinking red off");
                 ctx.address().do_send(BlinkRed { led_on: false });
             });
         } else {
             // turn on
-            set_all_to(&mut self.ws, |led| {
-                led.r = 255;
-                led.g = 0;
-                led.b = 0;
-            });
+            set_all_to(&mut self.controller, [0, 0, 255, 0]);
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
-                println!("Blinking red on");
                 ctx.address().do_send(BlinkRed { led_on: true });
             });
         }
     }
 }
 
-fn set_all_to<C>(ws: &mut Ws2812Rpi, colorizer: C) -> () where C: Fn(&mut RGB8) -> () {
-    let mut data: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
-    for led in data.iter_mut().step_by(1) {
-        colorizer(led)
+
+fn set_all_to(controller: &mut Controller, color: RawColor) -> () {
+    let leds = controller.leds_mut(0);
+    for led in leds {
+        *led = color
     }
-    ws.write(data.iter().cloned()).unwrap();
+    controller.render().unwrap();
 }
