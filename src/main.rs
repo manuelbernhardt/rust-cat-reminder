@@ -6,7 +6,8 @@ use std::io::ErrorKind::InvalidData;
 
 use actix::{Actor, Context};
 use actix::prelude::*;
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Utc, Duration, Timelike};
+use chrono_tz::Europe::Vienna;
 use rs_ws281x::*;
 use gpiod::{Chip, Options};
 
@@ -86,7 +87,7 @@ fn read_gpio(chip: &Chip) -> std::io::Result<bool> {
 
 
 fn load_state() -> DateTime<Utc> {
-    return if Path::new(STATE_FILE_PATH).exists() {
+    if Path::new(STATE_FILE_PATH).exists() {
         let time_str = fs::read_to_string(STATE_FILE_PATH);
 
         let parsed_time = time_str
@@ -96,7 +97,7 @@ fn load_state() -> DateTime<Utc> {
         match parsed_time {
             Ok(t) => t,
             Err(err) => {
-                println!("Error reading time from state: {:?}", err);
+                log::error!("Error reading time from state: {:?}", err);
                 Utc::now().to_owned()
             }
         }
@@ -137,7 +138,6 @@ impl Actor for LedManager {
 
         // schedule check every 5 seconds
         let _ = ctx.run_interval(time::Duration::from_secs(5), |_this, ctx| {
-            println!("Ticking");
             ctx.address().do_send(Tick { });
         });
     }
@@ -149,7 +149,10 @@ impl Handler<Tick> for LedManager {
 
 
     fn handle(&mut self, _msg: Tick, ctx: &mut Self::Context) -> Self::Result {
-        println!("Tick received");
+        log::debug!("Tick received");
+
+        let now = Utc::now().with_timezone(&Vienna);
+        let is_night = now.hour() >= 22 || now.hour() < 7;
 
         let delay_dark_green: Duration = Duration::hours(8);
         let delay_orange: Duration = Duration::hours(12);
@@ -158,7 +161,7 @@ impl Handler<Tick> for LedManager {
 
         let button_pushed = read_gpio(& self.chip).unwrap();
         if button_pushed {
-            println!("Button pushed");
+            log::debug!("Button pushed");
             // reset
             self.last_cleaning_time = reset_state();
 
@@ -167,25 +170,33 @@ impl Handler<Tick> for LedManager {
             }
         }
 
-        let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
-        if time_elapsed < delay_dark_green {
-            println!("Light green");
-            set_all_to(&mut self.controller, [0, 60, 0, 0]); // light green
-        } else if time_elapsed < delay_orange {
-            println!("Dark green");
-            set_all_to(&mut self.controller, [0, 20, 0, 0]); // dark green
-        } else if time_elapsed < delay_red {
-            println!("Orange");
-            set_all_to(&mut self.controller, [0, 60, 255, 0])
-        } else if time_elapsed < delay_dark_red {
-            println!("Red");
-            set_all_to(&mut self.controller, [0, 0, 255, 0]);
+        if is_night {
+            if self.is_blinking {
+                self.is_blinking = false;
+            }
+            set_all_to(&mut self.controller, [0, 0, 0, 0]);
         } else {
-            if !self.is_blinking {
-                self.is_blinking = true;
-                ctx.address().do_send(BlinkRed { led_on: false});
+            let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
+            if time_elapsed < delay_dark_green {
+                log::debug!("Light green");
+                set_all_to(&mut self.controller, [0, 60, 0, 0]); // light green
+            } else if time_elapsed < delay_orange {
+                log::debug!("Dark green");
+                set_all_to(&mut self.controller, [0, 20, 0, 0]); // dark green
+            } else if time_elapsed < delay_red {
+                log::debug!("Orange");
+                set_all_to(&mut self.controller, [0, 60, 255, 0])
+            } else if time_elapsed < delay_dark_red {
+                log::debug!("Red");
+                set_all_to(&mut self.controller, [0, 0, 255, 0]);
+            } else {
+                if !self.is_blinking {
+                    self.is_blinking = true;
+                    ctx.address().do_send(BlinkRed { led_on: false});
+                }
             }
         }
+
     }
 }
 
