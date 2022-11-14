@@ -17,33 +17,19 @@ const GPIO_BUTTON_PIN: u32 = 5;
 
 const STATE_FILE_PATH: &str = "cat_reminder_state";
 
-
-/*
-    Program logic:
-    - on start, retrieve state from file
-    - state contains the time of the last cleaning
-    - if no state, assume last reset now and write state to disk
-    - periodically (5 min) check where we're at
-      - now - state < DELAY_DARK_GREEN => set to light green
-      - now - state > DELAY_DARK_GREEN => set to dark green
-      - now - state > DELAY_ORANGE => set to orange
-      - now - state > DELAY_RED => set to red
-      - now - state > DELAY_RED => set to red and blink
-      - now - state > DELAY_RED => set to multiple colors blinking in many different ways
-    - when reset button pressed longer than 5 seconds
-      - set state to now
-      - store state
-      - stop blinking, set to light green
- */
+/// The Cat Litter Reminder, an annoying Raspberry PI with a LED Strip that signals when the cat litter box should be cleaned.
+/// 
+/// Main features:
+/// - LEDs have different colors depending on how urgent it is to clean the litter box
+/// - start to be really annoying when a full day has passed (blink in red)
+/// - don't display any lights during the night
 fn main() {
-    println!("Program start");
-
     const NUM_LEDS: i32 = 10;
     const LED_PIN: i32 = 18;
 
-    let system = actix::System::new();
-
     let last_cleaning_time: DateTime<Utc> = load_state();
+
+    let system = actix::System::new();
 
     let chip: Chip = Chip::new("gpiochip0").expect("Cannot open GPIO");
 
@@ -53,8 +39,8 @@ fn main() {
         .channel(
             0, // Channel Index
             ChannelBuilder::new()
-                .pin(LED_PIN) // GPIO 10 = SPI0 MOSI
-                .count(NUM_LEDS) // Number of LEDs
+                .pin(LED_PIN)
+                .count(NUM_LEDS)
                 .strip_type(StripType::Ws2812)
                 .brightness(100) // default: 255
                 .build(),
@@ -77,7 +63,12 @@ fn main() {
     system.run().unwrap();
 }
 
-fn read_gpio(chip: &Chip) -> std::io::Result<bool> {
+/// Reads the push button state. Expects the button to be connected at [GPIO_BUTTON_PIN]
+///
+/// # Errors
+///
+/// This function will return an error if the GPIO value cannot be read.
+fn read_button_state(chip: &Chip) -> std::io::Result<bool> {
     let opts = Options::input([GPIO_BUTTON_PIN]);
     let inputs = chip.request_lines(opts)?;
     let values = inputs.get_values([false; 1])?;
@@ -86,6 +77,21 @@ fn read_gpio(chip: &Chip) -> std::io::Result<bool> {
 }
 
 
+/// Sets all the LEDs to the provided [RawColor].
+///
+/// # Panics
+///
+/// Panics if there is an issue with the communication with the LED strip.
+fn set_all_led_to(controller: &mut Controller, color: RawColor) -> () {
+    let leds = controller.leds_mut(0);
+    for led in leds {
+        *led = color
+    }
+    controller.render().unwrap();
+}
+
+
+/// Loads the cat litter state (i.e. the last time at which the cat litter has been cleaned) from a file.
 fn load_state() -> DateTime<Utc> {
     if Path::new(STATE_FILE_PATH).exists() {
         let time_str = fs::read_to_string(STATE_FILE_PATH);
@@ -106,20 +112,11 @@ fn load_state() -> DateTime<Utc> {
     }
 }
 
+/// Resets the state, i.e. sets the time at which the cat litter has been cleaned to now.
 fn reset_state() -> DateTime<Utc> {
     let now = Utc::now();
     fs::write(STATE_FILE_PATH, now.to_rfc3339()).unwrap();
     now
-}
-
-#[derive(Message)]
-#[rtype(result = "()")]
-struct Tick;
-
-#[derive(Message)]
-#[rtype(result = "()")]
-struct BlinkRed {
-    led_on: bool
 }
 
 struct LedManager {
@@ -147,7 +144,6 @@ impl Actor for LedManager {
 impl Handler<Tick> for LedManager {
     type Result = ();
 
-
     fn handle(&mut self, _msg: Tick, ctx: &mut Self::Context) -> Self::Result {
         log::debug!("Tick received");
 
@@ -159,7 +155,7 @@ impl Handler<Tick> for LedManager {
         let delay_red: Duration = Duration::hours(24);
         let delay_dark_red: Duration = Duration::hours(26);
 
-        let button_pushed = read_gpio(& self.chip).unwrap();
+        let button_pushed = read_button_state(& self.chip).unwrap();
         if button_pushed {
             log::debug!("Button pushed");
             // reset
@@ -171,25 +167,28 @@ impl Handler<Tick> for LedManager {
         }
 
         if is_night {
+            // don't blink in red at night, it's annoying
             if self.is_blinking {
                 self.is_blinking = false;
             }
-            set_all_to(&mut self.controller, [0, 0, 0, 0]);
+            // go dark
+            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
         } else {
             let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
             if time_elapsed < delay_dark_green {
                 log::debug!("Light green");
-                set_all_to(&mut self.controller, [0, 60, 0, 0]); // light green
+                set_all_led_to(&mut self.controller, [0, 60, 0, 0]); // light green
             } else if time_elapsed < delay_orange {
                 log::debug!("Dark green");
-                set_all_to(&mut self.controller, [0, 20, 0, 0]); // dark green
+                set_all_led_to(&mut self.controller, [0, 20, 0, 0]); // dark green
             } else if time_elapsed < delay_red {
                 log::debug!("Orange");
-                set_all_to(&mut self.controller, [0, 60, 255, 0])
+                set_all_led_to(&mut self.controller, [0, 60, 255, 0])
             } else if time_elapsed < delay_dark_red {
                 log::debug!("Red");
-                set_all_to(&mut self.controller, [0, 0, 255, 0]);
+                set_all_led_to(&mut self.controller, [0, 0, 255, 0]);
             } else {
+                log::debug!("Blinking red");
                 if !self.is_blinking {
                     self.is_blinking = true;
                     ctx.address().do_send(BlinkRed { led_on: false});
@@ -206,17 +205,17 @@ impl Handler<BlinkRed> for LedManager {
     fn handle(&mut self, msg: BlinkRed, ctx: &mut Self::Context) -> Self::Result {
         if !self.is_blinking {
             // turn off
-            set_all_to(&mut self.controller, [0, 0, 0, 0]);
+            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
         } else if msg.led_on {
             // turn off
-            set_all_to(&mut self.controller, [0, 0, 0, 0]);
+            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
 
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
                 ctx.address().do_send(BlinkRed { led_on: false });
             });
         } else {
             // turn on
-            set_all_to(&mut self.controller, [0, 0, 255, 0]);
+            set_all_led_to(&mut self.controller, [0, 0, 255, 0]);
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
                 ctx.address().do_send(BlinkRed { led_on: true });
             });
@@ -224,11 +223,12 @@ impl Handler<BlinkRed> for LedManager {
     }
 }
 
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Tick;
 
-fn set_all_to(controller: &mut Controller, color: RawColor) -> () {
-    let leds = controller.leds_mut(0);
-    for led in leds {
-        *led = color
-    }
-    controller.render().unwrap();
+#[derive(Message)]
+#[rtype(result = "()")]
+struct BlinkRed {
+    led_on: bool
 }
