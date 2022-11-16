@@ -206,7 +206,10 @@ impl Handler<BlinkRed> for LedManager {
         if !self.is_blinking {
             // turn off
             set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
-        } else if msg.led_on {
+            return;
+        }
+        
+        if msg.led_on {
             // turn off
             set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
 
