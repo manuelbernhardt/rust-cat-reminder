@@ -8,8 +8,10 @@ use actix::{Actor, Context};
 use actix::prelude::*;
 use chrono::{DateTime, Utc, Duration, Timelike};
 use chrono_tz::Europe::Vienna;
-use rs_ws281x::*;
 use gpiod::{Chip, Options};
+
+mod led;
+use led::{LedController, RPILedController};
 
 const BLINK_DELAY: time::Duration = time::Duration::from_millis(500);
 
@@ -24,8 +26,6 @@ const STATE_FILE_PATH: &str = "cat_reminder_state";
 /// - start to be really annoying when a full day has passed (blink in red)
 /// - don't display any lights during the night
 fn main() {
-    const NUM_LEDS: i32 = 10;
-    const LED_PIN: i32 = 18;
 
     let last_cleaning_time: DateTime<Utc> = load_state();
 
@@ -33,20 +33,7 @@ fn main() {
 
     let chip: Chip = Chip::new("gpiochip0").expect("Cannot open GPIO");
 
-    let controller: Controller = ControllerBuilder::new()
-        .freq(800_000)
-        .dma(10)
-        .channel(
-            0, // Channel Index
-            ChannelBuilder::new()
-                .pin(LED_PIN)
-                .count(NUM_LEDS)
-                .strip_type(StripType::Ws2812)
-                .brightness(100) // default: 255
-                .build(),
-        )
-        .build()
-        .unwrap();
+    let controller = RPILedController::new();
 
 
     system.block_on(async {
@@ -75,21 +62,6 @@ fn read_button_state(chip: &Chip) -> std::io::Result<bool> {
     // false if pushed
     Ok(!values[0])
 }
-
-
-/// Sets all the LEDs to the provided [RawColor].
-///
-/// # Panics
-///
-/// Panics if there is an issue with the communication with the LED strip.
-fn set_all_led_to(controller: &mut Controller, color: RawColor) -> () {
-    let leds = controller.leds_mut(0);
-    for led in leds {
-        *led = color
-    }
-    controller.render().unwrap();
-}
-
 
 /// Loads the cat litter state (i.e. the last time at which the cat litter has been cleaned) from a file.
 fn load_state() -> DateTime<Utc> {
@@ -121,7 +93,7 @@ fn reset_state() -> DateTime<Utc> {
 
 struct LedManager {
     chip: Chip,
-    controller: Controller,
+    controller: RPILedController,
     last_cleaning_time: DateTime<Utc>,
     is_blinking: bool
 }
@@ -172,21 +144,21 @@ impl Handler<Tick> for LedManager {
                 self.is_blinking = false;
             }
             // go dark
-            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
+            self.controller.set_all_to(RPILedController::BLACK);
         } else {
             let time_elapsed = Utc::now().signed_duration_since(self.last_cleaning_time);
             if time_elapsed < delay_dark_green {
                 log::debug!("Light green");
-                set_all_led_to(&mut self.controller, [0, 60, 0, 0]); // light green
+                self.controller.set_all_to(RPILedController::LIGHT_GREEN);
             } else if time_elapsed < delay_orange {
                 log::debug!("Dark green");
-                set_all_led_to(&mut self.controller, [0, 20, 0, 0]); // dark green
+                self.controller.set_all_to(RPILedController::DARK_GREEN);
             } else if time_elapsed < delay_red {
                 log::debug!("Orange");
-                set_all_led_to(&mut self.controller, [0, 60, 255, 0])
+                self.controller.set_all_to(RPILedController::ORANGE);
             } else if time_elapsed < delay_dark_red {
                 log::debug!("Red");
-                set_all_led_to(&mut self.controller, [0, 0, 255, 0]);
+            self.controller.set_all_to(RPILedController::RED);
             } else {
                 log::debug!("Blinking red");
                 if !self.is_blinking {
@@ -205,20 +177,20 @@ impl Handler<BlinkRed> for LedManager {
     fn handle(&mut self, msg: BlinkRed, ctx: &mut Self::Context) -> Self::Result {
         if !self.is_blinking {
             // turn off
-            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
+            self.controller.set_all_to(RPILedController::BLACK);
             return;
         }
         
         if msg.led_on {
             // turn off
-            set_all_led_to(&mut self.controller, [0, 0, 0, 0]);
+            self.controller.set_all_to(RPILedController::BLACK);
 
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
                 ctx.address().do_send(BlinkRed { led_on: false });
             });
         } else {
             // turn on
-            set_all_led_to(&mut self.controller, [0, 0, 255, 0]);
+            self.controller.set_all_to(RPILedController::RED);
             let _ = ctx.run_later(BLINK_DELAY, |_this, ctx| {
                 ctx.address().do_send(BlinkRed { led_on: true });
             });
