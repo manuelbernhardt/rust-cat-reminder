@@ -27,24 +27,40 @@ const STATE_FILE_PATH: &str = "cat_reminder_state";
 /// - don't display any lights during the night
 fn main() {
 
-    let last_cleaning_time: DateTime<Utc> = load_state();
-
     let system = actix::System::new();
 
     let chip: Chip = Chip::new("gpiochip0").expect("Cannot open GPIO");
 
     let controller = RPILedController::new();
 
-
     system.block_on(async {
-        let _ = LedManager::create(|_ctx| {
+        let _ = LedManager::create(|ctx| {
+            let led_manager = ctx.address();
+
+            let state = load_state();
+
+            let (handler, listener) = node::split::<()>();
+
+            let cluster_manager = ClusterManager::create(|_ctx| 
+                ClusterManager { handler, listener, led_manager, last_cleaning_time: state
+            });
+
+            // before we start the led manager, check if we have a workable state, if not reset it
+            let last_cleaning_time = match state {
+                Some(state) => state,
+                None => reset_state()
+            };
+
             LedManager {
                 chip,
                 controller,
                 last_cleaning_time,
-                is_blinking: false
+                is_blinking: false,
+                cluster_manager
             }
         });
+
+
     });
 
     system.run().unwrap();
@@ -64,7 +80,7 @@ fn read_button_state(chip: &Chip) -> std::io::Result<bool> {
 }
 
 /// Loads the cat litter state (i.e. the last time at which the cat litter has been cleaned) from a file.
-fn load_state() -> DateTime<Utc> {
+fn load_state() -> Option<DateTime<Utc>> {
     if Path::new(STATE_FILE_PATH).exists() {
         let time_str = fs::read_to_string(STATE_FILE_PATH);
 
@@ -73,14 +89,14 @@ fn load_state() -> DateTime<Utc> {
             .map(|t| t.with_timezone(&Utc));
 
         match parsed_time {
-            Ok(t) => t,
+            Ok(t) => Some(t),
             Err(err) => {
                 log::error!("Error reading time from state: {:?}", err);
-                Utc::now().to_owned()
+                None
             }
         }
     } else {
-        reset_state()
+        None
     }
 }
 
@@ -95,7 +111,8 @@ struct LedManager {
     chip: Chip,
     controller: RPILedController,
     last_cleaning_time: DateTime<Utc>,
-    is_blinking: bool
+    is_blinking: bool,
+    cluster_manager: Addr<ClusterManager>
 }
 
 impl Actor for LedManager {
@@ -206,4 +223,102 @@ struct Tick;
 #[rtype(result = "()")]
 struct BlinkRed {
     led_on: bool
+}
+
+
+use message_io::network::{NetEvent, Transport};
+use message_io::node::NodeHandler;
+use message_io::node::NodeListener;
+use message_io::node::{self};
+
+struct ClusterManager {
+    handler: NodeHandler<()>,
+    listener: NodeListener<()>,
+    led_manager: Addr<LedManager>,
+    last_cleaning_time: Option<DateTime<Utc>>
+}
+
+impl Actor for ClusterManager {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+
+        fn to_bytes(msg: CatMessage) -> [u8; 5] {
+            let data = bincode::serialize(&msg).unwrap();
+            data.try_into().unwrap()
+        }
+
+        let multicast_addr = "224.0.0.69:6666";
+        let (endpoint, _) = self.handler.network().connect(Transport::Udp, multicast_addr).unwrap();
+
+        // FIXME unfortunately we cannot use this with the actor model in rust.
+
+        listener.for_each(move |event| match event.network() {
+            NetEvent::Connected(_, _always_true_for_udp) => {
+                log::info!("Connected to the network");
+                match self.last_cleaning_time {
+                    Some(_) => {}, // we're fine
+                    None => {
+                        log::info!("Asking other nodes for their state");
+                        let msg = CatMessage { message_type: 0, timestamp: None };
+                        self.handler.network().send(endpoint, &to_bytes(msg));
+
+                        // TODO if we're the first node, we will never get a reply
+                    }
+                }
+    
+                self.handler.network().listen(Transport::Udp, multicast_addr).unwrap();
+            }
+            NetEvent::Message(_, data) => {
+
+                let data = Vec::from(data);
+                let msg = bincode::deserialize::<CatMessage>(&data);
+                match msg {
+                    Ok(cat_message) => {
+                       match cat_message.message_type {
+                            0 => {
+                                // there's a new kid on the block
+                                self.handler.network().send(endpoint, &to_bytes(CatMessage { message_type: 1, timestamp: self.last_cleaning_time }));
+                            },
+                            1 => {
+                                // someone is broadcasting their state, let's check if it is interesting
+                                // TODO if this state is more recent than ours, inform the led_manager about it
+                                // TODO when the led_manager updates the state, inform this actor
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        log::error!("Could not parse message {}", err);
+                    }
+                }
+            },
+            NetEvent::Accepted(_, _) => unreachable!(), // UDP is not connection-oriented
+            NetEvent::Disconnected(_) => ()
+        });
+
+    }
+
+}
+
+use serde::{Serialize, Deserialize};
+use chrono::serde::ts_seconds_option;
+
+//  0                   1                   2                   3
+//  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |      Type     |                                               |
+//  +-+-+-+-+-+-+-+-+                                               +
+//  |                           Timestamp                           |
+//  +               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |               |                    Padding                    |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// message_type:
+// - 0: i don't know anything
+// - 1: here is my state
+#[derive(Serialize, Deserialize, Debug)]
+struct CatMessage {
+    message_type: u8,
+    #[serde(with = "ts_seconds_option")]
+    timestamp: Option<DateTime<Utc>>
 }
