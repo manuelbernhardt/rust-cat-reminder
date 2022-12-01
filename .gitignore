@@ -1,4 +1,6 @@
 /target
+.vscode
+.history
 .idea
 cat_reminder_state
 Cargo.lock
