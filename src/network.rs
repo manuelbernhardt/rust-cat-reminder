@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use crate::reminder::ReminderModuleEvent;
+use crate::reminder::ReminderEvent;
 
 enum Signal {
     Tick
@@ -19,7 +19,7 @@ pub enum NetworkEvent {
     StateUpdated(DateTime<Utc>)
 }
 
-pub fn run(ip_addr: IpAddr, port: u16, reminder_tx: Sender<ReminderModuleEvent>, rx: Receiver<NetworkEvent>, initial_state: DateTime<Utc>) {
+pub fn run(ip_addr: IpAddr, port: u16, reminder_tx: Sender<ReminderEvent>, rx: Receiver<NetworkEvent>, initial_state: DateTime<Utc>) {
     let addr: SocketAddr = SocketAddr::new(ip_addr, port);
 
     let (handler, listener) = node::split();
@@ -50,7 +50,7 @@ pub fn run(ip_addr: IpAddr, port: u16, reminder_tx: Sender<ReminderModuleEvent>,
                         Message::UpdateState(new_state) => {
                             log::info!("Update state received from network");
                             if let Some(timestamp) = new_state {
-                                reminder_tx.send(ReminderModuleEvent::CleaningTimeUpdate(timestamp)).expect("Failed to send updated state")
+                                reminder_tx.send(ReminderEvent::CleaningTimeUpdate(timestamp)).expect("Failed to send updated state")
                             }
                         }
                     }

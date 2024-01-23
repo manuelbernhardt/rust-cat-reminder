@@ -16,7 +16,7 @@ const BLINK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const LOOP_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 const GPIO_BUTTON_PIN: u32 = 5;
 
-pub enum ReminderModuleEvent {
+pub enum ReminderEvent {
     CleaningTimeUpdate(DateTime<Utc>)
 }
 
@@ -53,7 +53,7 @@ impl LEDStripState {
 pub struct Reminder {
     pub chip: Chip,
     pub controller: RPILedController,
-    pub reminder_rx: Receiver<ReminderModuleEvent>,
+    pub reminder_rx: Receiver<ReminderEvent>,
     pub network_tx: Sender<NetworkEvent>,
     pub last_cleaning_time: DateTime<Utc>,
     pub is_strip_on: bool
@@ -67,7 +67,7 @@ impl Reminder {
 
             if let Ok(event) = self.reminder_rx.try_recv() {
                 match event {
-                    ReminderModuleEvent::CleaningTimeUpdate(updated_cleaning_time) => {
+                    ReminderEvent::CleaningTimeUpdate(updated_cleaning_time) => {
                         log::info!("New cleaning time from network");
                         self.last_cleaning_time = updated_cleaning_time;
                     }
