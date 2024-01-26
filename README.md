@@ -1,11 +1,6 @@
-# Rust-based Cat Reminder for Raspberry PIs
+# Cat litter reminder
 
 This is a pet project (pun intended) for helping cat owners remember to clean the litter box.
-
-Articles:
-
-- [Building a cat litter box reminder with Rust](http://manuel.bernhardt.io/posts/2024-01-12-rust-cat-litter-box/)
-- [Fearless concurency with Rust and a few Raspberry PIs](http://manuel.bernhardt.io/posts/2024-01-26-rust-fearless-networked-concurrency-raspberry-pi/)
 
 ## Build notes (MacBook Pro M1)
 
