@@ -9,7 +9,7 @@ use chrono::Timelike;
 use gpiod::{Chip, Options};
 use rs_ws281x::RawColor;
 use crate::led::{LedController, RPILedController};
-use crate::network::NetworkEvent;
+use crate::transport::TransportEvent;
 
 
 const BLINK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -17,7 +17,7 @@ const LOOP_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 const GPIO_BUTTON_PIN: u32 = 5;
 
 pub enum ReminderEvent {
-    CleaningTimeUpdate(DateTime<Utc>)
+    CleaningTimeUpdated(DateTime<Utc>)
 }
 
 #[derive(PartialEq)]
@@ -54,7 +54,7 @@ pub struct Reminder {
     pub chip: Chip,
     pub controller: RPILedController,
     pub reminder_rx: Receiver<ReminderEvent>,
-    pub network_tx: Sender<NetworkEvent>,
+    pub transport_tx: Sender<TransportEvent>,
     pub last_cleaning_time: DateTime<Utc>,
     pub is_strip_on: bool
 }
@@ -67,7 +67,7 @@ impl Reminder {
 
             if let Ok(event) = self.reminder_rx.try_recv() {
                 match event {
-                    ReminderEvent::CleaningTimeUpdate(updated_cleaning_time) => {
+                    ReminderEvent::CleaningTimeUpdated(updated_cleaning_time) => {
                         log::info!("New cleaning time from network");
                         self.last_cleaning_time = updated_cleaning_time;
                     }
@@ -113,7 +113,7 @@ impl Reminder {
         if button_pushed {
             // reset
             self.last_cleaning_time = crate::reset_state();
-            self.network_tx.send(NetworkEvent::StateUpdated(self.last_cleaning_time)).expect("Could not send updated state");
+            self.transport_tx.send(TransportEvent::CleaningTimeReset(self.last_cleaning_time)).expect("Could not send updated state to transport module");
         }
     }
 

@@ -47,7 +47,7 @@ impl RPILedController {
                     .pin(Self::LED_PIN)
                     .count(Self::NUM_LEDS)
                     .strip_type(StripType::Ws2812)
-                    .brightness(100) // default: 255
+                    .brightness(50) // default: 255
                     .build(),
             )
             .build()

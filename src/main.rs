@@ -12,9 +12,9 @@ use led::RPILedController;
 use reminder::Reminder;
 
 mod led;
-mod network;
+mod transport;
 mod protocol;
-mod mdns;
+mod discovery;
 mod reminder;
 
 const STATE_FILE_PATH: &str = "cat_reminder_state";
@@ -35,18 +35,18 @@ fn main() {
     let ip_addr = local_ip_address::local_ip().expect("Could not resolve local IP address");
 
     let (reminder_tx, reminder_rx) = mpsc::channel();
-    let (network_tx, network_rx) = mpsc::channel();
+    let (transport_tx, transport_rx) = mpsc::channel();
 
-    let shutdown_hook = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown_hook)).unwrap();
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown_hook)).unwrap();
-    signal_hook::flag::register(signal_hook::consts::SIGQUIT, Arc::clone(&shutdown_hook)).unwrap();
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown_flag.clone()).unwrap();
+    signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown_flag.clone()).unwrap();
+    signal_hook::flag::register(signal_hook::consts::SIGQUIT, shutdown_flag.clone()).unwrap();
 
-    mdns::run(ip_addr, 5200, network_tx.clone(), Arc::clone(&shutdown_hook));
-    network::run(ip_addr, 5300, reminder_tx, network_rx, last_cleaning_time);
+    discovery::run(ip_addr, 5200, transport_tx.clone(), shutdown_flag.clone());
+    transport::run(ip_addr, 5300, reminder_tx, transport_rx, last_cleaning_time, shutdown_flag.clone());
 
-    let mut reminder = Reminder { chip, controller, reminder_rx, network_tx, last_cleaning_time, is_strip_on: false };
-    reminder.run(Arc::clone(&shutdown_hook));
+    let mut reminder = Reminder { chip, controller, reminder_rx, transport_tx, last_cleaning_time, is_strip_on: false };
+    reminder.run(shutdown_flag.clone());
 }
 
 
